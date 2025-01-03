@@ -1,0 +1,10 @@
+config_dir: /etc/wireguard
+endpoint: vpn.ian.coffee
+full_tunnel: true
+interface_name: eth0
+ipv4_subnet: 10.0.0.0/24
+ipv6_subnet: fd00::/64
+server_port: 51820
+server_private_key: GPBKDeRLWWHvJ7bEGdkhMjgEuOEufNgtwrvJticFCkA=
+server_public_key: 0g6MWYmq2/QwYrf+XLbddPl1cFpxSGhf/RaSkmkGTSE=
+wg_interface: wg0
