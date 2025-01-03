@@ -13,11 +13,46 @@ import requests
 logger = logging.getLogger(__name__)
 console = Console()
 
+DEFAULT_CONFIG = {
+    'ipv4_subnet': '10.0.0.0/24',
+    'ipv6_subnet': 'fd00::/64',
+    'wg_interface': 'wg0',
+    'server_port': 51820,
+    'config_dir': '/etc/wireguard',
+    'interface_name': 'eth0',
+    'server_public_key': '',  # Will be populated when server is initialized
+    'server_private_key': '',  # Will be populated when server is initialized
+    'full_tunnel': False,  # Default to split tunnel
+}
+
+def load_config(config_path=None):
+    """Load configuration from file or use defaults."""
+    config = DEFAULT_CONFIG.copy()
+    
+    if config_path and Path(config_path).exists():
+        try:
+            with open(config_path, 'r') as f:
+                user_config = yaml.safe_load(f)
+                if user_config:
+                    config.update(user_config)
+        except Exception as e:
+            logger.error(f"Failed to load config file: {e}")
+            sys.exit(1)
+    
+    return config
+
+def save_config(config, config_path):
+    """Save current configuration to file."""
+    try:
+        with open(config_path, 'w') as f:
+            yaml.safe_dump(config, f)
+    except Exception as e:
+        logger.error(f"Failed to save config file: {e}")
+        sys.exit(1)
 
 def get_config():
     """Get the configuration."""
-    with open('config.yaml', 'r') as file:
-        return yaml.safe_load(file)
+    return load_config('config.yaml')
 
 def get_clients():
     """Get the clients."""
@@ -47,7 +82,16 @@ def get_server_ips():
         'ipv4': first_ipv4_ip,
         'ipv6': first_ipv6_ip
     }
-    
+
+def get_allowed_ips(tunnel_type=None):
+    """Get allowed IPs based on tunnel type."""
+    cfg = get_config()
+    if tunnel_type is None:
+        tunnel_type = cfg.get('full_tunnel', False)
+    if tunnel_type:
+        return ['0.0.0.0/0', '::/0']
+    else:
+        return [cfg['ipv4_subnet'], cfg['ipv6_subnet']]
 
 def install_wireguard():
     """Install and configure WireGuard."""
@@ -76,12 +120,12 @@ def install_wireguard():
             # Create basic configuration
             config_content = f"""[Interface]
 PrivateKey = {private_key}
-Address = {ipv4}
+Address = {ipv4}, {ipv6}
 ListenPort = {port}
 
 # Enable IP forwarding and NAT
-PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {interface_name} -j MASQUERADE; iptables -A INPUT -p udp --dport {port} -j ACCEPT
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {interface_name} -j MASQUERADE; iptables -D INPUT -p udp --dport {port} -j ACCEPT
+PostUp = sysctl -w net.ipv4.ip_forward=1; sysctl -w net.ipv6.conf.all.forwarding=1; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {interface_name} -j MASQUERADE; ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -A FORWARD -o %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o {interface_name} -j MASQUERADE; iptables -A INPUT -p udp --dport {port} -j ACCEPT
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {interface_name} -j MASQUERADE; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -D FORWARD -o %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o {interface_name} -j MASQUERADE; iptables -D INPUT -p udp --dport {port} -j ACCEPT
 """
             wg0_conf.write_text(config_content)
             wg0_conf.chmod(0o600)
@@ -196,12 +240,6 @@ def create_client_config(name, client_private_key, client_public_key, server_pub
     if '/' not in client_ipv4:
         client_ipv4 = f"{client_ipv4}/32"
         
-    # If no allowed_ips specified, use default from config or fall back to split tunnel
-    if not allowed_ips:
-        if cfg.get('full_tunnel', False):
-            allowed_ips = ['0.0.0.0/0', '::/0']
-        else:
-            allowed_ips = [cfg.get('ipv4_subnet'), cfg.get('ipv6_subnet')]
     
     config = f"""[Interface]
 PrivateKey = {client_private_key}

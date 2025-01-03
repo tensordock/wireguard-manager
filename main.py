@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import logging
 import utils
-import config
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -54,7 +53,7 @@ def initialize_server(cfg):
         }
         utils.update_server_config(interface, [])
         
-        config.save_config(cfg, 'config.yaml')
+        utils.save_config(cfg, 'config.yaml')
         return cfg
     except Exception as e:
         logger.error(f"Failed to initialize server: {e}")
@@ -67,7 +66,7 @@ def initialize_server(cfg):
 def cli(ctx, config_file):
     """WireGuard VPN Manager"""
     ctx.ensure_object(dict)
-    ctx.obj['config'] = config.load_config(config_file)
+    ctx.obj['config'] = utils.load_config(config_file)
     ctx.obj['config'] = initialize_server(ctx.obj['config'])
 
 @cli.command(name='add')
@@ -84,16 +83,8 @@ def add_client(ctx, name, allowed_ips, peer_access, full_tunnel):
     try:
         cfg = ctx.obj['config']
         
-        # If full_tunnel not specified on command line, use config default
-        if full_tunnel is None:
-            full_tunnel = cfg.get('full_tunnel', False)
-
-        # If full tunnel is requested, route all traffic through VPN
-        if full_tunnel:
-            allowed_ips = ['0.0.0.0/0', '::/0']
-        elif not allowed_ips:
-            # Default to VPN subnets only for split tunnel
-            allowed_ips = [cfg['ipv4_subnet'], cfg['ipv6_subnet']]
+        # Get allowed IPs based on tunnel type
+        allowed_ips = utils.get_allowed_ips(full_tunnel)
 
         clients_file = Path('clients.json')
         clients = json.loads(clients_file.read_text()) if clients_file.exists() else {}
