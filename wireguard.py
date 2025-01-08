@@ -3,15 +3,20 @@ import subprocess
 import ipaddress
 from pathlib import Path
 import qrcode
+import base64
 import logging
+import time
 import json
 import socket
 import sys
+import os
 import yaml
 import requests
 from typing import Dict, List, Optional, Tuple, Set, Union
 from dataclasses import dataclass, asdict, field
 from rich.console import Console
+from rich.syntax import Syntax
+from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Confirm
 import argparse
@@ -33,6 +38,7 @@ class WireGuardConfig:
     wg_interface: str = 'wg0'
     server_port: int = 51820
     config_dir: str = '/etc/wireguard'
+    qr_dir: str = '/opt/wgm/qr_codes'
     interface_name: str = 'eth0'
     server_public_key: str = ''
     server_private_key: str = ''
@@ -59,9 +65,14 @@ class WireGuardManager:
     """Manages WireGuard VPN server and clients."""
     
     def __init__(self, config_path: str = 'config.yaml'):
-        self.config_path = Path(config_path)
+        # Get the directory where the script is located, following symlinks
+        self.script_dir = Path(os.path.realpath(__file__)).parent.resolve()
+        
+        # Use absolute paths based on script location
+        self.config_path = (self.script_dir / config_path).resolve()
+        self.clients_file = self.script_dir / 'clients.json'
+        
         self.config = self._load_config()
-        self.clients_file = Path('clients.json')
         self.clients: Dict[str, WireGuardClient] = {}
         self._load_clients()
 
@@ -420,10 +431,13 @@ class WireGuardManager:
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 raise RuntimeError("Failed to create WireGuard interface")
 
+            # Update DNS configuration AFTER interface is up and verified
+            self._update_dns_config()
+
         except Exception as e:
             logger.error(f"Failed to update server config: {e}")
             raise
-        
+                
     def _get_server_ips(self) -> str:
         """Get server IPs from subnet."""
         ipv4_net = ipaddress.ip_network(self.config.ipv4_subnet)
@@ -495,10 +509,32 @@ class WireGuardManager:
         except Exception as e:
             logger.error(f"Failed to update client restrictions: {e}")
             raise
-
-    def add_client(self, name: str, full_tunnel: Optional[bool] = None, 
-                  restricted_ips: Optional[List[str]] = None,
-                  restricted_ip6s: Optional[List[str]] = None) -> None:
+        
+    def _create_install_command(self, client_config: str, interface_name: str = 'wg0') -> str:
+        """Create installation command using base64 encoding with line wrapping."""
+        install_script = (
+            f"apt update && "
+            f"apt install -y wireguard && "
+            f"wg-quick down {interface_name} || true && "
+            f"rm -f /etc/wireguard/{interface_name}.conf && "
+            f"cat > /etc/wireguard/{interface_name}.conf << EOF\n"
+            f"{client_config}\n"
+            f"EOF\n"
+            f"chmod 600 /etc/wireguard/{interface_name}.conf && "
+            f"systemctl enable wg-quick@{interface_name} && "
+            f"wg-quick up {interface_name}"
+        )
+        
+        # Encode the script and wrap at 50 characters
+        encoded = base64.b64encode(install_script.encode()).decode()
+        wrapped = '\\\n'.join([encoded[i:i+50] for i in range(0, len(encoded), 50)])
+        
+        # Return wrapped command
+        return f"echo \\\n{wrapped} | base64 -d | sudo bash"
+       
+    def add_client(self, name: str, full_tunnel: Optional[bool] = None,
+                restricted_ips: Optional[List[str]] = None,
+                restricted_ip6s: Optional[List[str]] = None) -> None:
         """Add a new WireGuard client."""
         try:
             if name in self.clients:
@@ -551,59 +587,264 @@ class WireGuardManager:
             config_path.write_text(config_content)
             config_path.chmod(0o600)
 
-            # Generate QR code
-            qr = qrcode.QRCode(version=1, box_size=10, border=5)
-            qr.add_data(config_content)
-            qr.make(fit=True)
-            qr.make_image(fill_color="black", back_color="white").save(f"{name}_qr.png")
+            # Ensure QR directory exists
+            Path(self.config.qr_dir).mkdir(parents=True, exist_ok=True)
+            
+            # Generate QR code using qrencode
+            qr_path = Path(self.config.qr_dir) / f"{name}_qr.png"
+            try:
+                self._run_command([
+                    'qrencode',
+                    '-t', 'png',
+                    '-o', str(qr_path),
+                    '-s', '2',
+                    '-m', '1'
+                ], input_data=config_content)
+            except Exception as e:
+                logger.warning(f"Failed to generate QR code: {e}. Please install qrencode package.")
 
-            # Update clients
+            # Update system configurations
             self.clients[name] = client
             self._save_clients()
-            
-            # Update firewall rules
             self._update_client_firewall_rules(client)
-            
-            # Update server config
             self._update_server_config()
 
-            console.print(f"[green]Successfully created client {name}[/green]")
-            console.print(f"Configuration saved to: {config_path}")
-            console.print(f"QR code saved to: {name}_qr.png")
-            if client.restricted_ips:
-                console.print("[yellow]IPv4 restrictions: " + ", ".join(client.restricted_ips))
-            if client.restricted_ip6s:
-                console.print("[yellow]IPv6 restrictions: " + ", ".join(client.restricted_ip6s))
+            # Print success and show configuration
+            console.print(f"\n[bold green]Successfully created client {name}[/bold green]")
+            self.show_client_config(name, config_content, show_qr=False)
 
         except Exception as e:
             logger.error(f"Failed to add client: {e}")
             raise
+                
+    def _update_dns_config(self) -> None:
+        """Update DNS configuration for client name resolution."""
+        try:
+            # First, handle any existing DNS services
+            try:
+                # Check if systemd-resolved is active
+                result = subprocess.run(['systemctl', 'is-active', 'systemd-resolved'], 
+                                     capture_output=True, text=True)
+                if result.stdout.strip() == 'active':
+                    self._run_command(['systemctl', 'stop', 'systemd-resolved'])
+                    self._run_command(['systemctl', 'disable', 'systemd-resolved'])
+                
+                # Kill any existing dnsmasq processes
+                self._run_command(['killall', 'dnsmasq'], timeout=5)
+            except subprocess.CalledProcessError:
+                # It's okay if these fail (services might not exist)
+                pass
+                
+            # Wait for WireGuard interface to be up
+            retries = 5
+            while retries > 0 and not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
+                time.sleep(1)
+                retries -= 1
+            
+            if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
+                logger.warning(f"WireGuard interface {self.config.wg_interface} not found")
+                return
+
+            # Install dnsmasq if not present
+            if not Path('/usr/sbin/dnsmasq').exists():
+                self._run_command(['apt', 'update'])
+                self._run_command(['apt', 'install', '-y', 'dnsmasq'])
+
+            # Create dnsmasq config directory
+            dnsmasq_dir = Path('/etc/dnsmasq.d')
+            dnsmasq_dir.mkdir(parents=True, exist_ok=True)
+
+            # Generate dnsmasq configuration
+            config_lines = [
+                '# WireGuard VPN DNS configuration',
+                f'listen-address={self._get_server_ips().split(",")[0].split("/")[0]}',
+                'port=53',
+                f'interface={self.config.wg_interface}',
+                'bind-interfaces',
+                'domain=vpn.local',
+                'expand-hosts',
+                'local=/vpn.local/',
+                'domain-needed',
+                'bogus-priv',
+                'no-resolv',
+                'no-poll',
+                'server=8.8.8.8',
+                'server=8.8.4.4',
+                ''  # End with newline
+            ]
+
+            # Add client host entries
+            hosts_lines = []
+            server_ip = self._get_server_ips().split(',')[0].split('/')[0]
+            hosts_lines.append(f"{server_ip} vpn.local gateway")
+            
+            for client in self.clients.values():
+                client_ip = client.ipv4.split('/')[0]
+                client_ip6 = client.ipv6.split('/')[0]
+                base_name = f"{client.name}.vpn.local"
+                hosts_lines.extend([
+                    f"{client_ip} {base_name} {client.name}",
+                    f"{client_ip6} {base_name} {client.name}"
+                ])
+            hosts_lines.append('')  # End with newline
+
+            # Clean up old config files
+            config_path = dnsmasq_dir / 'wireguard.conf'
+            hosts_path = Path('/etc/hosts.wireguard')
+            
+            # Write new config files
+            config_path.write_text('\n'.join(config_lines))
+            hosts_path.write_text('\n'.join(hosts_lines))
+
+            # Update main dnsmasq configuration
+            dnsmasq_conf = Path('/etc/dnsmasq.conf')
+            if dnsmasq_conf.exists():
+                current_config = dnsmasq_conf.read_text()
+                # Remove any existing WireGuard related config
+                new_lines = [line for line in current_config.splitlines() 
+                        if not any(x in line for x in ['WireGuard', str(hosts_path), str(config_path)])]
+                
+                # Add our configuration
+                new_lines.extend([
+                    '',
+                    '# WireGuard VPN configuration',
+                    f'addn-hosts={hosts_path}',
+                    f'conf-file={config_path}',
+                    ''  # End with newline
+                ])
+                
+                dnsmasq_conf.write_text('\n'.join(new_lines))
+            else:
+                dnsmasq_conf.write_text('\n'.join([
+                    '# WireGuard VPN configuration',
+                    f'addn-hosts={hosts_path}',
+                    f'conf-file={config_path}',
+                    ''  # End with newline
+                ]))
+
+            # Restart dnsmasq with proper error handling
+            try:
+                # First stop
+                self._run_command(['systemctl', 'stop', 'dnsmasq'])
+                time.sleep(2)  # Give it time to fully stop
+                
+                # Then start
+                self._run_command(['systemctl', 'start', 'dnsmasq'])
+                
+                # Verify it's running
+                status = self._run_command(['systemctl', 'is-active', 'dnsmasq'])
+                if status != 'active':
+                    raise RuntimeError(f"dnsmasq failed to start, status: {status}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to restart dnsmasq: {e}")
+                # Try to get more detailed error information
+                try:
+                    status = self._run_command(['systemctl', 'status', 'dnsmasq'])
+                    logger.error(f"dnsmasq status: {status}")
+                except Exception:
+                    pass
+                raise
+
+        except Exception as e:
+            logger.error(f"Failed to update DNS configuration: {e}")
+            raise
 
     def _create_client_config(self, client: WireGuardClient, private_key: str) -> str:
         """Create client configuration."""
+        # Get server IP for DNS
+        server_ip = self._get_server_ips().split(',')[0].split('/')[0]
+            
         return '\n'.join([
             '[Interface]',
             f'PrivateKey = {private_key}',
             f'Address = {client.ipv4}, {client.ipv6}',
-            'DNS = 8.8.8.8, 8.8.4.4',
+            f'DNS = {server_ip}',  # Point to WireGuard server for DNS
             '',
             '[Peer]',
             f'PublicKey = {self.config.server_public_key}',
             f'AllowedIPs = {", ".join(client.allowed_ips)}',
             f'Endpoint = {self.config.endpoint}:{self.config.server_port}',
-            'PersistentKeepalive = 25',
+            'PersistentKeepalive = 10',
             ''  # Add empty string to create final newline
         ])
+        
+    def show_client_config(self, name: str, config_content: Optional[str] = None, show_qr: bool = False) -> None:
+        """Show configuration details for a client.
+        
+        Args:
+            name: Client name
+            config_content: Optional pre-generated config content (for new clients)
+            show_header: Whether to show the header (can be disabled for add_client)
+        """
+        try:
+            # Get client config path
+            config_path = Path(self.config.config_dir) / f"{name}.conf"
+            qr_path = Path(self.config.qr_dir) / f"{name}_qr.png"
 
-    def remove_client(self, name: str) -> None:
+            # For existing clients, read config from file if not provided
+            if config_content is None:
+                if not config_path.exists():
+                    console.print(f"[red]Configuration file not found: {config_path}[/red]")
+                    return
+                config_content = config_path.read_text()
+
+            # Generate installation command
+            install_command = self._create_install_command(config_content)
+
+            # Print configuration details
+            console.print("\n[bold blue]Configuration Files:[/bold blue]")
+            console.print(f"Config file: {config_path}")
+            console.print(f"QR code: {qr_path}")
+            
+            # Also display QR code in terminal
+            if show_qr:
+                try:
+                    console.print("\n[yellow]Terminal QR Code:[/yellow]")
+                    qr_terminal = subprocess.run(
+                        ['qrencode', '-t', 'ansi', '-m', '1', '-s', '1', '-o', str(qr_path)],
+                        input=config_content,
+                        capture_output=True,
+                        text=True
+                    )
+                    print(qr_terminal.stdout)
+                except Exception as e:
+                    logger.warning(f"Failed to generate terminal QR code: {e}")
+            
+            console.print("\n[bold blue]Installation Command:[/bold blue]")
+            # print(install_command)
+            # console.print(Syntax(install_command, "bash", word_wrap=False, theme="github-dark"))
+            # console.print(Syntax(install_command, "bash", word_wrap=False, line_numbers=False))
+            console.print(install_command, style="white on black")
+            # console.print(install_command)
+            
+            console.print("\n[bold blue]Configuration Content:[/bold blue]")
+            config_content = config_content.rstrip()
+            console.print(Syntax(config_content, "ini", theme="github-dark"))  
+
+            # Show restrictions if client exists
+            if name in self.clients:
+                client = self.clients[name]
+                if client.restricted_ips or client.restricted_ip6s:
+                    restrictions = []
+                    restrictions.extend(client.restricted_ips)
+                    restrictions.extend(client.restricted_ip6s)
+                    console.print("\n[yellow]IP restrictions:[/yellow] " + 
+                                ", ".join(restrictions))
+
+        except Exception as e:
+            logger.error(f"Failed to show client configuration: {e}")
+            raise
+        
+    def remove_client(self, name: str, skip_confirm: bool = False) -> None:
         """Remove a WireGuard client."""
         try:
             if name not in self.clients:
                 console.print(f"[red]Client {name} not found[/red]")
                 return
 
-            # Confirm deletion
-            if not Confirm.ask(f"Are you sure you want to remove client {name}?"):
+            # Confirm deletion unless skip_confirm is True
+            if not skip_confirm and not Confirm.ask(f"Are you sure you want to remove client {name}?"):
                 return
 
             # Clean up firewall rules before removing client
@@ -615,7 +856,7 @@ class WireGuardManager:
                 config_path.unlink()
 
             # Remove QR code if exists
-            qr_path = Path(f"{name}_qr.png")
+            qr_path = Path(self.config.qr_dir) / f"{name}_qr.png"
             if qr_path.exists():
                 qr_path.unlink()
 
@@ -629,6 +870,31 @@ class WireGuardManager:
         except Exception as e:
             logger.error(f"Failed to remove client: {e}")
             raise
+        
+    def _get_client_status(self) -> Dict[str, Dict[str, str]]:
+        """Get status information for all clients from wg command."""
+        try:
+            wg_output = self._run_command(['wg', 'show', self.config.wg_interface])
+            current_peer = None
+            peer_info = {}
+            
+            for line in wg_output.split('\n'):
+                line = line.strip()
+                if line.startswith('peer:'):
+                    current_peer = line.split(':')[1].strip()
+                    peer_info[current_peer] = {'status': 'Offline', 'last_seen': 'Never'}
+                elif current_peer and 'latest handshake:' in line.lower():
+                    handshake_time = line.split(':')[1].strip()
+                    if handshake_time != 'Never':
+                        # Consider client online if last handshake was within 3 minutes
+                        if 'minutes' not in handshake_time or int(handshake_time.split()[0]) <= 3:
+                            peer_info[current_peer]['status'] = 'Online'
+                        peer_info[current_peer]['last_seen'] = handshake_time
+            
+            return peer_info
+        except Exception as e:
+            logger.warning(f"Failed to get client status: {e}")
+            return {}
 
     def list_clients(self) -> None:
         """List all WireGuard clients."""
@@ -637,6 +903,9 @@ class WireGuardManager:
                 console.print("[yellow]No clients found[/yellow]")
                 return
 
+            # Get current status for all clients
+            client_status = self._get_client_status()
+
             table = Table(
                 title="WireGuard Clients",
                 show_header=True,
@@ -644,33 +913,64 @@ class WireGuardManager:
                 show_lines=True
             )
             
-            table.add_column("Name", style="cyan")
-            table.add_column("IPv4", style="green")
-            table.add_column("IPv6", style="green")
-            table.add_column("Tunnel Mode", style="yellow")
-            table.add_column("Restrictions", style="red", max_width=40)
-            table.add_column("Created", style="blue")
+            table.add_column("Name", style="bold blue")
+            table.add_column("Status", style="")
+            table.add_column("Addresses", style="")
+            table.add_column("Tunnel Mode", style="")
+            table.add_column("Restrictions", style="", max_width=40)
+            table.add_column("Last Seen", style="")
+            table.add_column("Created", style="dim")
+
+            # Create a mapping of public keys to client names
+            pubkey_to_name = {client.public_key: name for name, client in self.clients.items()}
 
             for name, client in sorted(self.clients.items()):
-                tunnel_mode = "Full" if "0.0.0.0/0" in client.allowed_ips else "Split"
-                created = datetime.fromisoformat(client.created_at).strftime("%Y-%m-%d %H:%M") if client.created_at else "Unknown"
+                tunnel_mode = "[blue]Full[/blue]" if "0.0.0.0/0" in client.allowed_ips else "[yellow]Split[/yellow]"
+                # in german format
+                created = datetime.fromisoformat(client.created_at).strftime("%d.%m.%Y %H:%M") if client.created_at else "Unknown"
                 
+                # Get status info for this client
+                status = "Unknown"
+                last_seen = "Never"
+                for pubkey, info in client_status.items():
+                    if pubkey == client.public_key:
+                        status = info['status']
+                        last_seen = info['last_seen']
+                        break
+
+                # Format restrictions
                 restrictions = []
                 if client.restricted_ips:
-                    restrictions.append("IPv4: " + ", ".join(client.restricted_ips))
+                    restrictions.extend(client.restricted_ips)
                 if client.restricted_ip6s:
-                    restrictions.append("IPv6: " + ", ".join(client.restricted_ip6s))
+                    restrictions.extend(client.restricted_ip6s)
+                restriction_text = ", ".join(restrictions) if restrictions else "[dim]None[/dim]"
                 
-                restriction_text = "\n".join(restrictions) if restrictions else "None"
+                # Set status style
+                status_display = f"● {status}"
+                if status == "Online":
+                    status_display = f"[green]{status_display}[/green]"
+                else:
+                    status_display = f"[red]{status_display}[/red]"
+                
+                # Addresses
+                addresses = []
+                if client.ipv4:
+                    addresses.append(client.ipv4)
+                if client.ipv6:
+                    addresses.append(client.ipv6)
+                    
+                addresses_text = "\n".join(addresses) if addresses else "Unknown"
                 
                 table.add_row(
                     name,
-                    client.ipv4,
-                    client.ipv6,
+                    status_display,
+                    addresses_text,
                     tunnel_mode,
                     restriction_text,
+                    last_seen,
                     created
-                )
+                )        
 
             console.print(table)
 
@@ -695,16 +995,20 @@ def main():
     add_parser.add_argument("--restrict-to", nargs="+", metavar="IP", 
         help="List of IP addresses/networks this client can access (both IPv4 and IPv6)")
     
+    # Show config command
+    config_parser = subparsers.add_parser("config", help="Show client configuration details")
+    config_parser.add_argument("name", help="Client name")
+    config_parser.add_argument("--show-qr", action="store_true", help="Show QR code in terminal")
     # Remove client command
     remove_parser = subparsers.add_parser("remove", help="Remove a client")
     remove_parser.add_argument("name", help="Client name")
+    remove_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     
     # List clients command
     subparsers.add_parser("list", help="List all clients")
     
     # Manage restrictions command
-    restrict_parser = subparsers.add_parser("restrict", 
-        help="Manage client IP restrictions")
+    restrict_parser = subparsers.add_parser("restrict", help="Manage client IP restrictions")
     restrict_parser.add_argument("name", help="Client name")
     restrict_parser.add_argument("--allow", nargs="+", metavar="IP",
         help="Add IP addresses/networks to allowed list")
@@ -745,8 +1049,11 @@ def main():
             else:
                 manager.add_client(args.name, full_tunnel)
         
+        elif args.command == "config":
+            manager.show_client_config(args.name, show_qr=args.show_qr)
+        
         elif args.command == "remove":
-            manager.remove_client(args.name)
+            manager.remove_client(args.name, skip_confirm=args.yes)
         
         elif args.command == "list":
             manager.list_clients()
@@ -801,3 +1108,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
