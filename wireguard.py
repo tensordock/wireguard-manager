@@ -35,6 +35,7 @@ class WireGuardConfig:
     """WireGuard server configuration."""
     ipv4_subnet: str = '10.0.0.0/24'
     ipv6_subnet: str = 'fd00::/64'
+    min_ipv4: str = ''  # Minimum IPv4 address to start assignments from (e.g. 10.69.1.1)
     wg_interface: str = 'wg0'
     server_port: int = 51820
     config_dir: str = '/etc/wireguard'
@@ -188,8 +189,31 @@ class WireGuardManager:
         used_ipv4s = {client.ipv4.split('/')[0] for client in self.clients.values()}
         used_ipv6s = {client.ipv6.split('/')[0] for client in self.clients.values()}
         
-        # Skip first IP (reserved for server)
-        for ip in list(ipv4_net.hosts())[1:]:
+        # Start from min_ipv4 if set, otherwise skip first IP (reserved for server)
+        if self.config.min_ipv4:
+            try:
+                start_ipv4 = ipaddress.IPv4Address(self.config.min_ipv4)
+                if start_ipv4 not in ipv4_net:
+                    logger.warning(f"Minimum IPv4 {start_ipv4} is not in subnet {ipv4_net}. Using network default.")
+                    start_index = 1  # Skip first IP (reserved for server)
+                else:
+                    # Calculate offset from network start
+                    start_index = int(start_ipv4) - int(ipv4_net.network_address)
+                    if start_index <= 1:  # First IP is reserved for server
+                        start_index = 1
+            except ValueError:
+                logger.warning(f"Invalid minimum IPv4 address: {self.config.min_ipv4}. Using network default.")
+                start_index = 1
+        else:
+            start_index = 1  # Skip first IP (reserved for server)
+        
+        # Get all hosts and start from the specified index
+        ipv4_hosts = list(ipv4_net.hosts())
+        if start_index >= len(ipv4_hosts):
+            logger.warning(f"Minimum IPv4 index {start_index} is out of range. Using network default.")
+            start_index = 1
+            
+        for ip in ipv4_hosts[start_index:]:
             if str(ip) not in used_ipv4s:
                 next_ipv4 = f"{ip}/{ipv4_net.prefixlen}"
                 break
@@ -985,7 +1009,12 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     # Initialize command
-    subparsers.add_parser("init", help="Initialize WireGuard server")
+    init_parser = subparsers.add_parser("init", help="Initialize WireGuard server")
+    init_parser.add_argument("--min-ipv4", help="Minimum IPv4 address to start assigning from (e.g. 10.69.1.1)")
+    
+    # Set config command
+    set_config_parser = subparsers.add_parser("set-config", help="Update server configuration")
+    set_config_parser.add_argument("--min-ipv4", help="Minimum IPv4 address to start assigning from (e.g. 10.69.1.1)")
     
     # Add client command
     add_parser = subparsers.add_parser("add", help="Add a new client")
@@ -1023,7 +1052,17 @@ def main():
         manager = WireGuardManager(args.config)
         
         if args.command == "init":
+            if hasattr(args, 'min_ipv4') and args.min_ipv4:
+                manager.config.min_ipv4 = args.min_ipv4
             manager.initialize()
+        
+        elif args.command == "set-config":
+            if hasattr(args, 'min_ipv4') and args.min_ipv4:
+                manager.config.min_ipv4 = args.min_ipv4
+                manager._save_config()
+                console.print(f"[green]Updated minimum IPv4 address to {args.min_ipv4}[/green]")
+            else:
+                console.print("[yellow]No configuration changes specified[/yellow]")
         
         elif args.command == "add":
             if args.full_tunnel and args.split_tunnel:

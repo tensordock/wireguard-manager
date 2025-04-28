@@ -28,3 +28,11 @@ wgm restrict client1 --clear
 # You can combine operations
 wgm restrict client1 --allow 10.0.0.1 --deny 192.168.1.100
 ```
+
+```
+# Initialize with a specific minimum IPv4 address (useful for large subnets)
+wgm init --min-ipv4 10.69.1.1
+
+# Update the minimum IPv4 address for future client assignments
+wgm set-config --min-ipv4 10.69.2.1
+```
